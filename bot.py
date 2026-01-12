@@ -1,4 +1,4 @@
-# bot.py — версия 13: быстрая задача из пересылки без повторного ввода текста
+# bot.py — версия 14: полностью на PostgreSQL (asyncpg)
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -11,14 +11,18 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
-import aiosqlite
+import asyncpg
 from dotenv import load_dotenv
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в .env")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL не задан в .env")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -33,37 +37,51 @@ class TaskCreation(StatesGroup):
     waiting_for_minute = State()
     waiting_for_problem_description = State()
 
+# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ===
 async def init_db():
-    async with aiosqlite.connect("/tmp/deadline.db") as db:
-        await db.execute("""
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 full_name TEXT,
                 username TEXT
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                creator_id INTEGER NOT NULL,
-                assignee_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                creator_id BIGINT NOT NULL,
+                assignee_id BIGINT NOT NULL,
                 text TEXT NOT NULL,
-                deadline DATETIME NOT NULL,
+                deadline TIMESTAMP NOT NULL,
                 status TEXT DEFAULT 'pending',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_check_time DATETIME,
-                checkpoints_enabled BOOLEAN DEFAULT 1
+                created_at TIMESTAMP DEFAULT NOW(),
+                last_check_time TIMESTAMP,
+                checkpoints_enabled BOOLEAN DEFAULT TRUE
             )
         """)
-        await db.commit()
+    finally:
+        await conn.close()
 
+async def get_db():
+    return await asyncpg.connect(DATABASE_URL)
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 async def save_user(user):
-    async with aiosqlite.connect("/tmp/deadline.db") as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO users (user_id, full_name, username) VALUES (?, ?, ?)",
-            (user.id, user.full_name or "", user.username or "")
+    conn = await get_db()
+    try:
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, full_name, username) 
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE 
+            SET full_name = $2, username = $3
+            """,
+            user.id, user.full_name or "", user.username or ""
         )
-        await db.commit()
+    finally:
+        await conn.close()
 
 def format_name(user_id: int, full_name: str, username: str) -> str:
     if username:
@@ -73,16 +91,19 @@ def format_name(user_id: int, full_name: str, username: str) -> str:
     return f"Пользователь {user_id}"
 
 async def get_frequent_assignees(creator_id: int):
-    async with aiosqlite.connect("/tmp/deadline.db") as db:
-        cursor = await db.execute("""
+    conn = await get_db()
+    try:
+        rows = await conn.fetch("""
             SELECT DISTINCT u.user_id, u.full_name, u.username
             FROM tasks t
             JOIN users u ON t.assignee_id = u.user_id
-            WHERE t.creator_id = ? AND u.user_id != ?
+            WHERE t.creator_id = $1 AND u.user_id != $1
             ORDER BY t.created_at DESC
             LIMIT 10
-        """, (creator_id, creator_id))
-        return await cursor.fetchall()
+        """, creator_id)
+        return rows
+    finally:
+        await conn.close()
 
 # === ОБРАБОТКА ПЕРЕСЫЛКИ ===
 @router.message(F.forward_date)
@@ -109,7 +130,7 @@ async def handle_any_forward(message: Message, state: FSMContext):
 async def start_quick_task(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     quick_text = data.get("quick_task_text", "Задача из переписки")
-    await state.update_data(text=quick_text, is_quick_task=True)  # ← ФЛАГ!
+    await state.update_data(text=quick_text, is_quick_task=True)
     
     creator_id = callback.from_user.id
     frequent = await get_frequent_assignees(creator_id)
@@ -118,7 +139,10 @@ async def start_quick_task(callback: CallbackQuery, state: FSMContext):
     builder.button(text="👤 Себе", callback_data="assign_to_self")
     if frequent:
         builder.button(text="— ⭐ Ранее назначали —", callback_data="ignore")
-        for uid, name, uname in frequent:
+        for row in frequent:
+            uid = row["user_id"]
+            name = row["full_name"]
+            uname = row["username"]
             label = format_name(uid, name, uname)
             builder.button(text=label[:25], callback_data=f"pick_user_{uid}")
     builder.button(text="📨 Другой пользователь", callback_data="assign_by_forward")
@@ -168,19 +192,30 @@ async def cmd_start(message: Message):
 async def my_tasks(message: Message):
     await save_user(message.from_user)
     user_id = message.from_user.id
-    async with aiosqlite.connect("/tmp/deadline.db") as db:
-        cursor = await db.execute(
-            "SELECT id, text, deadline, status, creator_id FROM tasks WHERE (assignee_id = ? OR creator_id = ?) AND status IN ('pending', 'in_progress') ORDER BY deadline",
-            (user_id, user_id)
+    conn = await get_db()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT id, text, deadline, status, creator_id 
+            FROM tasks 
+            WHERE (assignee_id = $1 OR creator_id = $1) 
+              AND status IN ('pending', 'in_progress') 
+            ORDER BY deadline
+            """,
+            user_id
         )
-        rows = await cursor.fetchall()
+    finally:
+        await conn.close()
+
     if not rows:
         await message.answer("📭 У вас нет активных задач.")
         return
+
     text = "📋 Ваши активные задачи:\n\n"
     for row in rows:
-        _, t_text, deadline_str, _, creator_id = row
-        deadline = datetime.fromisoformat(deadline_str)
+        t_text = row["text"]
+        deadline = row["deadline"]
+        creator_id = row["creator_id"]
         deadline_fmt = deadline.strftime("%d.%m %H:%M")
         role = "👤 Вы поставили" if creator_id == user_id else "🧑 Вам назначили"
         text += f"• {t_text}\n  📅 {deadline_fmt} | {role}\n\n"
@@ -189,7 +224,6 @@ async def my_tasks(message: Message):
 @router.message(Command("newtask"))
 async def new_task_start(message: Message, state: FSMContext):
     await save_user(message.from_user)
-    # Для обычной задачи — флаг отсутствует
     creator_id = message.from_user.id
     frequent = await get_frequent_assignees(creator_id)
 
@@ -197,7 +231,10 @@ async def new_task_start(message: Message, state: FSMContext):
     builder.button(text="👤 Себе", callback_data="assign_to_self")
     if frequent:
         builder.button(text="— ⭐ Ранее назначали —", callback_data="ignore")
-        for uid, name, uname in frequent:
+        for row in frequent:
+            uid = row["user_id"]
+            name = row["full_name"]
+            uname = row["username"]
             label = format_name(uid, name, uname)
             builder.button(text=label[:25], callback_data=f"pick_user_{uid}")
     builder.button(text="📨 Другой пользователь", callback_data="assign_by_forward")
@@ -215,17 +252,23 @@ async def assign_to_self(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("pick_user_"))
 async def pick_user(callback: CallbackQuery, state: FSMContext):
     assignee_id = int(callback.data.split("_")[2])
-    async with aiosqlite.connect("/tmp/deadline.db") as db:
-        cursor = await db.execute(
-            "SELECT user_id, full_name, username FROM users WHERE user_id = ?", (assignee_id,)
+    conn = await get_db()
+    try:
+        row = await conn.fetchrow(
+            "SELECT user_id, full_name, username FROM users WHERE user_id = $1",
+            assignee_id
         )
-        row = await cursor.fetchone()
+    finally:
+        await conn.close()
+        
     if not row:
         await callback.message.edit_text("❌ Пользователь не найден.")
         await state.clear()
         return
 
-    uid, full_name, username = row
+    uid = row["user_id"]
+    full_name = row["full_name"]
+    username = row["username"]
     assignee_name = format_name(uid, full_name, username)
     await state.update_data(assignee_id=assignee_id, assignee_name=assignee_name)
     await proceed_after_assignee(callback, state)
@@ -266,7 +309,7 @@ async def handle_forwarded(message: Message, state: FSMContext):
 async def not_forwarded(message: Message):
     await message.answer("⚠️ Пожалуйста, перешлите сообщение от пользователя.")
 
-# === ВВОД ТЕКСТА (только для обычных задач) ===
+# === ВВОД ТЕКСТА И ВРЕМЕНИ ===
 @router.message(TaskCreation.waiting_for_text)
 async def process_text(message: Message, state: FSMContext):
     await state.update_data(text=message.text)
@@ -274,7 +317,6 @@ async def process_text(message: Message, state: FSMContext):
     await message.answer("📅 Выберите дату:", reply_markup=kb.as_markup())
     await state.set_state(TaskCreation.waiting_for_date)
 
-# === КАЛЕНДАРЬ И ВРЕМЯ (без изменений) ===
 def create_7day_calendar() -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     today = datetime.today().date()
@@ -338,14 +380,18 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
         duration = (deadline - datetime.now()).total_seconds()
         checkpoints_enabled = duration > 600
 
-        async with aiosqlite.connect("/tmp/deadline.db") as db:
-            await db.execute(
-                "INSERT INTO tasks (creator_id, assignee_id, text, deadline, checkpoints_enabled) VALUES (?, ?, ?, ?, ?)",
-                (creator_id, assignee_id, text, deadline_iso, int(checkpoints_enabled))
+        conn = await get_db()
+        try:
+            task_id = await conn.fetchval(
+                """
+                INSERT INTO tasks (creator_id, assignee_id, text, deadline, checkpoints_enabled)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+                """,
+                creator_id, assignee_id, text, deadline_iso, checkpoints_enabled
             )
-            await db.commit()
-            cursor = await db.execute("SELECT last_insert_rowid()")
-            task_id = (await cursor.fetchone())[0]
+        finally:
+            await conn.close()
 
         asyncio.create_task(schedule_all_checks(callback.bot, task_id, creator_id, assignee_id, text, deadline, checkpoints_enabled))
 
@@ -373,11 +419,7 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         await callback.answer()
 
-# === ПЛАНИРОВЩИК И ОСТАЛЬНОЕ (без изменений) ===
-# ... (остальной код точно такой же, как в предыдущей версии) ...
-# Чтобы уложиться в лимит, я опускаю повторяющиеся части — они идентичны.
-# Главное — выше реализована логика пропуска текста для быстрых задач.
-
+# === ПЛАНИРОВЩИК ===
 async def schedule_all_checks(bot: Bot, task_id: int, creator_id: int, assignee_id: int, task_text: str, deadline: datetime, checkpoints_enabled: bool):
     now = datetime.now()
     if deadline <= now:
@@ -415,14 +457,17 @@ async def schedule_final_check(bot: Bot, task_id: int, creator_id: int, assignee
     except:
         pass
 
+# === ОБРАБОТКА КНОПОК ===
 @router.callback_query(F.data.startswith("interim_done_"))
 async def interim_done(callback: CallbackQuery):
     parts = callback.data.split("_")
     task_id = int(parts[2])
     creator_id = int(parts[3])
-    async with aiosqlite.connect("/tmp/deadline.db") as db:
-        await db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
-        await db.commit()
+    conn = await get_db()
+    try:
+        await conn.execute("UPDATE tasks SET status = 'done' WHERE id = $1", task_id)
+    finally:
+        await conn.close()
     await callback.message.edit_text("✅ Задача завершена досрочно!")
     try:
         await callback.bot.send_message(creator_id, "🔔 Исполнитель завершил задачу раньше срока!")
@@ -465,9 +510,11 @@ async def task_done(callback: CallbackQuery):
     parts = callback.data.split("_")
     task_id = int(parts[1])
     creator_id = int(parts[2])
-    async with aiosqlite.connect("/tmp/deadline.db") as db:
-        await db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
-        await db.commit()
+    conn = await get_db()
+    try:
+        await conn.execute("UPDATE tasks SET status = 'done' WHERE id = $1", task_id)
+    finally:
+        await conn.close()
     await callback.message.edit_text("✅ Задача выполнена!")
     try:
         await callback.bot.send_message(creator_id, "🔔 Задача отмечена как **выполненная**!")
@@ -480,9 +527,11 @@ async def task_not_done(callback: CallbackQuery):
     parts = callback.data.split("_")
     task_id = int(parts[1])
     creator_id = int(parts[2])
-    async with aiosqlite.connect("/tmp/deadline.db") as db:
-        await db.execute("UPDATE tasks SET status = 'failed' WHERE id = ?", (task_id,))
-        await db.commit()
+    conn = await get_db()
+    try:
+        await conn.execute("UPDATE tasks SET status = 'failed' WHERE id = $1", task_id)
+    finally:
+        await conn.close()
     await callback.message.edit_text("❌ Задача не выполнена в срок.")
     try:
         await callback.bot.send_message(creator_id, "🔔 Задача **не была выполнена** в срок.")
@@ -495,5 +544,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-
     asyncio.run(main())
