@@ -1,4 +1,4 @@
-# bot.py — версия 24: /mytasks корректно фильтрует по UTC
+# bot.py — версия 25: /mytasks показывает все незавершённые задачи (без фильтра по времени)
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -129,7 +129,6 @@ async def my_tasks(message: Message):
             FROM tasks 
             WHERE (assignee_id = $1 OR creator_id = $1) 
               AND status = 'pending'
-              AND deadline > NOW() AT TIME ZONE 'UTC'
             ORDER BY deadline
             """,
             user_id
@@ -141,7 +140,7 @@ async def my_tasks(message: Message):
         await message.answer("📭 У вас нет активных задач.")
         return
 
-    text = "📋 Ваши активные задачи:\n\n"
+    text = "📋 Ваши задачи:\n\n"
     for row in rows:
         t_text = row["text"]
         deadline = row["deadline"]
