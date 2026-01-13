@@ -1,4 +1,4 @@
-# bot.py — версия 17: поддержка задач из ЛЮБОГО сообщения (файлы, фото, видео)
+# bot.py — версия 18: восстановление напоминаний + поддержка файлов
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -564,8 +564,36 @@ async def task_not_done(callback: CallbackQuery):
         pass
     await callback.answer()
 
+# === ВОССТАНОВЛЕНИЕ НАПОМИНАНИЙ ПРИ СТАРТЕ ===
+async def restore_pending_checks():
+    """Восстанавливает все активные напоминания при запуске бота"""
+    conn = await get_db()
+    try:
+        rows = await conn.fetch("""
+            SELECT id, creator_id, assignee_id, text, deadline, checkpoints_enabled
+            FROM tasks
+            WHERE status = 'pending' AND deadline > NOW()
+        """)
+    finally:
+        await conn.close()
+
+    for row in rows:
+        task_id = row["id"]
+        creator_id = row["creator_id"]
+        assignee_id = row["assignee_id"]
+        text = row["text"]
+        deadline = row["deadline"]
+        checkpoints_enabled = row["checkpoints_enabled"]
+        
+        # Запускаем напоминания
+        asyncio.create_task(schedule_all_checks(
+            bot, task_id, creator_id, assignee_id, text, deadline, checkpoints_enabled
+        ))
+        print(f"Восстановлены напоминания для задачи {task_id}")
+
 async def main():
     await init_db()
+    await restore_pending_checks()  # ← КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
