@@ -1,4 +1,4 @@
-# bot.py — версия 20: всё работает идеально на Railway
+# bot.py — версия 21: правильный порядок обработчиков + всё остальное
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -27,7 +27,7 @@ if not DATABASE_URL:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
-dp.include_router(router)
+# ВАЖНО: router подключается в самом конце!
 
 class TaskCreation(StatesGroup):
     waiting_for_assignee = State()
@@ -106,105 +106,7 @@ async def get_frequent_assignees(creator_id: int):
     finally:
         await conn.close()
 
-# === ОБРАБОТКА ЛЮБОГО СООБЩЕНИЯ (включая файлы) ===
-@router.message()
-async def handle_any_message(message: Message, state: FSMContext):
-    # ВСЕГДА пропускаем команды дальше (даже при активном FSM)
-    if message.text and message.text.startswith("/"):
-        return
-
-    current_state = await state.get_state()
-    if current_state is not None:
-        return  # Игнорируем обычные сообщения, если создаём задачу
-
-    await save_user(message.from_user)
-    
-    # Извлекаем текст или генерируем описание для медиа
-    if message.text:
-        text = message.text
-    elif message.caption:
-        text = message.caption
-    elif message.document:
-        file_name = message.document.file_name or "документ"
-        text = f"📄 Документ: {file_name}"
-    elif message.photo:
-        text = "🖼️ Фотография"
-    elif message.video:
-        text = "🎥 Видео"
-    elif message.audio:
-        performer = message.audio.performer or ""
-        title = message.audio.title or "аудио"
-        text = f"🎵 Аудио: {performer} – {title}" if performer else f"🎵 {title}"
-    elif message.voice:
-        text = "🎤 Голосовое сообщение"
-    elif message.animation:
-        text = "🎬 Анимация"
-    else:
-        text = "📎 Вложение"
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Создать задачу", callback_data="quick_task_from_forward")
-    builder.button(text="❌ Отмена", callback_data="ignore")
-    builder.adjust(2)
-    
-    await message.answer(
-        f"📩 Создать задачу из этого сообщения?\n\n«{text[:150]}{'...' if len(text) > 150 else ''}»",
-        reply_markup=builder.as_markup()
-    )
-    await state.update_data(quick_task_text=text)
-
-@router.callback_query(F.data == "quick_task_from_forward")
-async def start_quick_task(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    quick_text = data.get("quick_task_text", "Задача из переписки")
-    await state.update_data(text=quick_text, is_quick_task=True)
-    
-    creator_id = callback.from_user.id
-    frequent = await get_frequent_assignees(creator_id)
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="👤 Себе", callback_data="assign_to_self")
-    if frequent:
-        builder.button(text="— ⭐ Ранее назначали —", callback_data="ignore")
-        for row in frequent:
-            uid = row["user_id"]
-            name = row["full_name"]
-            uname = row["username"]
-            label = format_name(uid, name, uname)
-            builder.button(text=label[:25], callback_data=f"pick_user_{uid}")
-    builder.button(text="📨 Другой пользователь", callback_data="assign_by_forward")
-    builder.adjust(1)
-    
-    await callback.message.edit_text("👥 Кому назначить задачу?", reply_markup=builder.as_markup())
-    await state.set_state(TaskCreation.waiting_for_assignee)
-    await callback.answer()
-
-@router.callback_query(F.data == "ignore")
-async def ignore_callback(callback: CallbackQuery):
-    await callback.answer()
-
-# === УНИВЕРСАЛЬНЫЙ ПЕРЕХОД ПОСЛЕ ВЫБОРА ИСПОЛНИТЕЛЯ ===
-async def proceed_after_assignee(callback_or_message, state: FSMContext):
-    data = await state.get_data()
-    is_quick = data.get("is_quick_task", False)
-    
-    if is_quick:
-        kb = create_7day_calendar()
-        if isinstance(callback_or_message, CallbackQuery):
-            await callback_or_message.message.edit_text("📅 Выберите дату:", reply_markup=kb.as_markup())
-            await callback_or_message.answer()
-        else:
-            await callback_or_message.answer("📅 Выберите дату:", reply_markup=kb.as_markup())
-        await state.set_state(TaskCreation.waiting_for_date)
-    else:
-        if isinstance(callback_or_message, CallbackQuery):
-            await callback_or_message.message.edit_text("📝 Напишите текст задачи:")
-            await callback_or_message.answer()
-        else:
-            await callback_or_message.answer("📝 Напишите текст задачи:")
-        await state.set_state(TaskCreation.waiting_for_text)
-
-# === ОСНОВНЫЕ КОМАНДЫ ===
+# === ОСНОВНЫЕ КОМАНДЫ (регистрируются ПЕРВЫМИ!) ===
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await save_user(message.from_user)
@@ -270,6 +172,105 @@ async def new_task_start(message: Message, state: FSMContext):
     
     await message.answer("👥 Кому назначить задачу?", reply_markup=builder.as_markup())
     await state.set_state(TaskCreation.waiting_for_assignee)
+
+# === ОБРАБОТКА ЛЮБОГО СООБЩЕНИЯ (регистрируется ПОСЛЕ команд!) ===
+@router.message()
+async def handle_any_message(message: Message, state: FSMContext):
+    # ВСЕГДА пропускаем команды дальше (даже при активном FSM)
+    if message.text and message.text.startswith("/"):
+        return
+
+    current_state = await state.get_state()
+    if current_state is not None:
+        return  # Игнорируем обычные сообщения, если создаём задачу
+
+    await save_user(message.from_user)
+    
+    # Извлекаем текст или генерируем описание для медиа
+    if message.text:
+        text = message.text
+    elif message.caption:
+        text = message.caption
+    elif message.document:
+        file_name = message.document.file_name or "документ"
+        text = f"📄 Документ: {file_name}"
+    elif message.photo:
+        text = "🖼️ Фотография"
+    elif message.video:
+        text = "🎥 Видео"
+    elif message.audio:
+        performer = message.audio.performer or ""
+        title = message.audio.title or "аудио"
+        text = f"🎵 Аудио: {performer} – {title}" if performer else f"🎵 {title}"
+    elif message.voice:
+        text = "🎤 Голосовое сообщение"
+    elif message.animation:
+        text = "🎬 Анимация"
+    else:
+        text = "📎 Вложение"
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Создать задачу", callback_data="quick_task_from_forward")
+    builder.button(text="❌ Отмена", callback_data="ignore")
+    builder.adjust(2)
+    
+    await message.answer(
+        f"📩 Создать задачу из этого сообщения?\n\n«{text[:150]}{'...' if len(text) > 150 else ''}»",
+        reply_markup=builder.as_markup()
+    )
+    await state.update_data(quick_task_text=text)
+
+# === ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ===
+@router.callback_query(F.data == "quick_task_from_forward")
+async def start_quick_task(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    quick_text = data.get("quick_task_text", "Задача из переписки")
+    await state.update_data(text=quick_text, is_quick_task=True)
+    
+    creator_id = callback.from_user.id
+    frequent = await get_frequent_assignees(creator_id)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Себе", callback_data="assign_to_self")
+    if frequent:
+        builder.button(text="— ⭐ Ранее назначали —", callback_data="ignore")
+        for row in frequent:
+            uid = row["user_id"]
+            name = row["full_name"]
+            uname = row["username"]
+            label = format_name(uid, name, uname)
+            builder.button(text=label[:25], callback_data=f"pick_user_{uid}")
+    builder.button(text="📨 Другой пользователь", callback_data="assign_by_forward")
+    builder.adjust(1)
+    
+    await callback.message.edit_text("👥 Кому назначить задачу?", reply_markup=builder.as_markup())
+    await state.set_state(TaskCreation.waiting_for_assignee)
+    await callback.answer()
+
+@router.callback_query(F.data == "ignore")
+async def ignore_callback(callback: CallbackQuery):
+    await callback.answer()
+
+# === УНИВЕРСАЛЬНЫЙ ПЕРЕХОД ПОСЛЕ ВЫБОРА ИСПОЛНИТЕЛЯ ===
+async def proceed_after_assignee(callback_or_message, state: FSMContext):
+    data = await state.get_data()
+    is_quick = data.get("is_quick_task", False)
+    
+    if is_quick:
+        kb = create_7day_calendar()
+        if isinstance(callback_or_message, CallbackQuery):
+            await callback_or_message.message.edit_text("📅 Выберите дату:", reply_markup=kb.as_markup())
+            await callback_or_message.answer()
+        else:
+            await callback_or_message.answer("📅 Выберите дату:", reply_markup=kb.as_markup())
+        await state.set_state(TaskCreation.waiting_for_date)
+    else:
+        if isinstance(callback_or_message, CallbackQuery):
+            await callback_or_message.message.edit_text("📝 Напишите текст задачи:")
+            await callback_or_message.answer()
+        else:
+            await callback_or_message.answer("📝 Напишите текст задачи:")
+        await state.set_state(TaskCreation.waiting_for_text)
 
 # === ВЫБОР ИСПОЛНИТЕЛЯ ===
 @router.callback_query(F.data == "assign_to_self")
@@ -628,6 +629,9 @@ async def task_not_done(callback: CallbackQuery):
     except:
         pass
     await callback.answer()
+
+# === ПОДКЛЮЧЕНИЕ ROUTER В САМОМ КОНЦЕ ===
+dp.include_router(router)
 
 async def main():
     await init_db()
