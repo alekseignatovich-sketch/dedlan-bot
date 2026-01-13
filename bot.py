@@ -1,4 +1,4 @@
-# bot.py — версия 16: исправлены все ошибки для Railway + PostgreSQL
+# bot.py — версия 17: поддержка задач из ЛЮБОГО сообщения (файлы, фото, видео)
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -106,16 +106,42 @@ async def get_frequent_assignees(creator_id: int):
     finally:
         await conn.close()
 
-# === ОБРАБОТКА ПЕРЕСЫЛКИ ===
-@router.message(F.forward_date)
-async def handle_any_forward(message: Message, state: FSMContext):
+# === ОБРАБОТКА ЛЮБОГО СООБЩЕНИЯ (включая файлы) ===
+@router.message()
+async def handle_any_message(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is not None:
+        return  # Игнорируем, если уже создаём задачу
+
+    # Игнорируем команды
+    if message.text and message.text.startswith("/"):
         return
 
     await save_user(message.from_user)
-    text = message.text or message.caption or "Без текста"
     
+    # Извлекаем текст или генерируем описание для медиа
+    if message.text:
+        text = message.text
+    elif message.caption:
+        text = message.caption
+    elif message.document:
+        file_name = message.document.file_name or "документ"
+        text = f"📄 Документ: {file_name}"
+    elif message.photo:
+        text = "🖼️ Фотография"
+    elif message.video:
+        text = "🎥 Видео"
+    elif message.audio:
+        performer = message.audio.performer or ""
+        title = message.audio.title or "аудио"
+        text = f"🎵 Аудио: {performer} – {title}" if performer else f"🎵 {title}"
+    elif message.voice:
+        text = "🎤 Голосовое сообщение"
+    elif message.animation:
+        text = "🎬 Анимация"
+    else:
+        text = "📎 Вложение"
+
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Создать задачу", callback_data="quick_task_from_forward")
     builder.button(text="❌ Отмена", callback_data="ignore")
@@ -184,8 +210,9 @@ async def cmd_start(message: Message):
     await save_user(message.from_user)
     await message.answer(
         "👋 Привет! Я бот *Deadline* — помогаю ставить задачи и следить за их выполнением.\n\n"
+        "Просто отправьте любое сообщение (текст, файл, фото) — и я предложу создать задачу!\n\n"
         "Команды:\n"
-        "/newtask — создать задачу\n"
+        "/newtask — создать задачу вручную\n"
         "/mytasks — ваши задачи"
     )
 
@@ -377,7 +404,6 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
         creator_id = callback.from_user.id
         assignee_id = data["assignee_id"]
         text = data["text"]
-        # ВАЖНО: передаём объект datetime, а не строку!
         duration = (deadline - datetime.now()).total_seconds()
         checkpoints_enabled = duration > 600
 
@@ -389,7 +415,7 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
                 VALUES ($1, $2, $3, $4, $5)
                 RETURNING id
                 """,
-                creator_id, assignee_id, text, deadline, checkpoints_enabled  # ← deadline как datetime
+                creator_id, assignee_id, text, deadline, checkpoints_enabled
             )
         finally:
             await conn.close()
@@ -404,9 +430,7 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
             try:
                 await callback.bot.send_message(
                     assignee_id,
-                    f"🔔 Вам назначена новая задача от {callback.from_user.full_name}:\n\n"
-                    f"«{text}»\n"
-                    f"📅 Дедлайн: {deadline_fmt}"
+                    f"🔔 Вам назначена новая задача:\n\n«{text}»\n📅 Дедлайн: {deadline_fmt}"
                 )
             except:
                 pass
