@@ -1,11 +1,11 @@
-# bot.py — версия 21: правильный порядок обработчиков + всё остальное
+# bot.py — версия 22: надёжная работа команд и сообщений
 import os
 import asyncio
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -27,7 +27,6 @@ if not DATABASE_URL:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
-# ВАЖНО: router подключается в самом конце!
 
 class TaskCreation(StatesGroup):
     waiting_for_assignee = State()
@@ -106,7 +105,7 @@ async def get_frequent_assignees(creator_id: int):
     finally:
         await conn.close()
 
-# === ОСНОВНЫЕ КОМАНДЫ (регистрируются ПЕРВЫМИ!) ===
+# === ОСНОВНЫЕ КОМАНДЫ ===
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await save_user(message.from_user)
@@ -173,16 +172,12 @@ async def new_task_start(message: Message, state: FSMContext):
     await message.answer("👥 Кому назначить задачу?", reply_markup=builder.as_markup())
     await state.set_state(TaskCreation.waiting_for_assignee)
 
-# === ОБРАБОТКА ЛЮБОГО СООБЩЕНИЯ (регистрируется ПОСЛЕ команд!) ===
-@router.message()
+# === ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ТОЛЬКО ДЛЯ СООБЩЕНИЙ НЕ В FSM ===
+@router.message(StateFilter(None))
 async def handle_any_message(message: Message, state: FSMContext):
-    # ВСЕГДА пропускаем команды дальше (даже при активном FSM)
-    if message.text and message.text.startswith("/"):
+    # Игнорируем команды
+    if message.text and (message.text.startswith("/") or message.text.startswith("\\") or message.text.startswith("!")):
         return
-
-    current_state = await state.get_state()
-    if current_state is not None:
-        return  # Игнорируем обычные сообщения, если создаём задачу
 
     await save_user(message.from_user)
     
@@ -445,26 +440,21 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
 
 # === ФОНОВАЯ ПРОВЕРКА ЗАДАЧ КАЖДЫЕ 5 МИНУТ ===
 async def background_checker():
-    """Проверяет задачи каждые 5 минут и отправляет напоминания"""
     while True:
         try:
             await check_due_tasks()
         except Exception as e:
             print(f"[BACKGROUND ERROR] {e}")
-        await asyncio.sleep(300)  # 5 минут
+        await asyncio.sleep(300)
 
 async def check_due_tasks():
-    """Проверяет, нужно ли отправить напоминания"""
     now = datetime.now()
     conn = await get_db()
     try:
-        # Промежуточные напоминания (50% и 90%)
         rows = await conn.fetch("""
             SELECT id, creator_id, assignee_id, text, deadline, created_at, last_check_time
             FROM tasks
-            WHERE status = 'pending' 
-              AND deadline > $1
-              AND checkpoints_enabled = true
+            WHERE status = 'pending' AND deadline > $1 AND checkpoints_enabled = true
         """, now)
         
         for row in rows:
@@ -483,7 +473,6 @@ async def check_due_tasks():
             time_elapsed = (now - created_at).total_seconds()
             progress = time_elapsed / total_duration
             
-            # Первое напоминание (50%) - если ещё не отправляли
             if progress >= 0.5 and last_check is None:
                 msg = f"🔄 Как продвигается задача?\n\n«{text}»"
                 kb = InlineKeyboardBuilder()
@@ -494,11 +483,8 @@ async def check_due_tasks():
                 try:
                     await bot.send_message(assignee_id, msg, reply_markup=kb.as_markup())
                     await conn.execute("UPDATE tasks SET last_check_time = $1 WHERE id = $2", now, task_id)
-                    print(f"[NOTIFY] Промежуточное напоминание (50%) для задачи {task_id}")
                 except:
                     pass
-                    
-            # Второе напоминание (90%) - если уже отправляли первое
             elif progress >= 0.9 and last_check is not None:
                 msg = f"⚠️ Скоро дедлайн! Как продвигается задача?\n\n«{text}»"
                 kb = InlineKeyboardBuilder()
@@ -509,11 +495,9 @@ async def check_due_tasks():
                 try:
                     await bot.send_message(assignee_id, msg, reply_markup=kb.as_markup())
                     await conn.execute("UPDATE tasks SET last_check_time = $1 WHERE id = $2", now, task_id)
-                    print(f"[NOTIFY] Промежуточное напоминание (90%) для задачи {task_id}")
                 except:
                     pass
         
-        # Финальные напоминания (по истечении дедлайна)
         final_rows = await conn.fetch("""
             SELECT id, creator_id, assignee_id, text
             FROM tasks
@@ -536,17 +520,11 @@ async def check_due_tasks():
                     reply_markup=kb.as_markup()
                 )
                 await conn.execute("UPDATE tasks SET status = 'notified' WHERE id = $1", task_id)
-                print(f"[NOTIFY] Финальное напоминание для задачи {task_id}")
             except:
                 pass
                 
     finally:
         await conn.close()
-
-# === ВОССТАНОВЛЕНИЕ НАПОМИНАНИЙ ПРИ СТАРТЕ ===
-async def restore_pending_checks():
-    """Заглушка для совместимости"""
-    pass
 
 # === ОБРАБОТКА КНОПОК ===
 @router.callback_query(F.data.startswith("interim_done_"))
@@ -630,12 +608,11 @@ async def task_not_done(callback: CallbackQuery):
         pass
     await callback.answer()
 
-# === ПОДКЛЮЧЕНИЕ ROUTER В САМОМ КОНЦЕ ===
+# === ПОДКЛЮЧЕНИЕ ROUTER ===
 dp.include_router(router)
 
 async def main():
     await init_db()
-    await restore_pending_checks()
     asyncio.create_task(background_checker())
     await dp.start_polling(bot)
 
