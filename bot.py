@@ -1,4 +1,4 @@
-# bot.py — версия 15: полностью совместим с PostgreSQL на Railway
+# bot.py — версия 16: исправлены все ошибки для Railway + PostgreSQL
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -377,7 +377,7 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
         creator_id = callback.from_user.id
         assignee_id = data["assignee_id"]
         text = data["text"]
-        deadline_iso = deadline.isoformat()
+        # ВАЖНО: передаём объект datetime, а не строку!
         duration = (deadline - datetime.now()).total_seconds()
         checkpoints_enabled = duration > 600
 
@@ -389,7 +389,7 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
                 VALUES ($1, $2, $3, $4, $5)
                 RETURNING id
                 """,
-                creator_id, assignee_id, text, deadline_iso, checkpoints_enabled
+                creator_id, assignee_id, text, deadline, checkpoints_enabled  # ← deadline как datetime
             )
         finally:
             await conn.close()
