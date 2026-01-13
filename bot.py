@@ -1,4 +1,4 @@
-# bot.py — версия 22: надёжная работа команд и сообщений
+# bot.py — версия 23: /mytasks показывает только активные задачи
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -128,7 +128,8 @@ async def my_tasks(message: Message):
             SELECT id, text, deadline, status, creator_id 
             FROM tasks 
             WHERE (assignee_id = $1 OR creator_id = $1) 
-              AND status IN ('pending', 'in_progress') 
+              AND status = 'pending'
+              AND deadline > NOW()
             ORDER BY deadline
             """,
             user_id
