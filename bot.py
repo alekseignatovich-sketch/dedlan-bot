@@ -1,4 +1,4 @@
-# bot.py — версия 19: надёжные напоминания для Railway + поддержка файлов
+# bot.py — версия 20: всё работает идеально на Railway
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -109,13 +109,13 @@ async def get_frequent_assignees(creator_id: int):
 # === ОБРАБОТКА ЛЮБОГО СООБЩЕНИЯ (включая файлы) ===
 @router.message()
 async def handle_any_message(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is not None:
-        return  # Игнорируем, если уже создаём задачу
-
-    # Игнорируем команды
+    # ВСЕГДА пропускаем команды дальше (даже при активном FSM)
     if message.text and message.text.startswith("/"):
         return
+
+    current_state = await state.get_state()
+    if current_state is not None:
+        return  # Игнорируем обычные сообщения, если создаём задачу
 
     await save_user(message.from_user)
     
@@ -420,9 +420,6 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
         finally:
             await conn.close()
 
-        # Не используем asyncio.create_task для долгих задач!
-        # Вместо этого rely on background_checker
-
         deadline_fmt = deadline.strftime("%d.%m в %H:%M")
         assignee_name = data["assignee_name"]
         await callback.message.edit_text(f"✅ Задача назначена {assignee_name}!\n📅 Дедлайн: {deadline_fmt}")
@@ -547,9 +544,7 @@ async def check_due_tasks():
 
 # === ВОССТАНОВЛЕНИЕ НАПОМИНАНИЙ ПРИ СТАРТЕ ===
 async def restore_pending_checks():
-    """Восстанавливает все активные напоминания при запуске бота"""
-    # Теперь это делает background_checker, но оставим для совместимости
-    print("Восстановление задач при старте...")
+    """Заглушка для совместимости"""
     pass
 
 # === ОБРАБОТКА КНОПОК ===
@@ -637,7 +632,7 @@ async def task_not_done(callback: CallbackQuery):
 async def main():
     await init_db()
     await restore_pending_checks()
-    asyncio.create_task(background_checker())  # ← КЛЮЧЕВОЙ ЭЛЕМЕНТ ДЛЯ RAILWAY
+    asyncio.create_task(background_checker())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
