@@ -1,4 +1,4 @@
-# bot.py — версия 26: защита от "сломанного" FSM + подтверждение прерывания
+# bot.py — версия 27: стабильная версия с восстановлением напоминаний
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -105,6 +105,44 @@ async def get_frequent_assignees(creator_id: int):
     finally:
         await conn.close()
 
+# === ПЛАНИРОВЩИК НАПОМИНАНИЙ ===
+async def schedule_all_checks(bot: Bot, task_id: int, creator_id: int, assignee_id: int, task_text: str, deadline: datetime, checkpoints_enabled: bool):
+    now = datetime.now()
+    if deadline <= now:
+        return
+    total_seconds = (deadline - now).total_seconds()
+    if checkpoints_enabled:
+        delay_50 = total_seconds * 0.5
+        asyncio.create_task(schedule_intermediate_check(bot, task_id, creator_id, assignee_id, task_text, delay_50))
+        delay_90 = total_seconds * 0.9
+        asyncio.create_task(schedule_intermediate_check(bot, task_id, creator_id, assignee_id, task_text, delay_90))
+    delay_final = total_seconds
+    asyncio.create_task(schedule_final_check(bot, task_id, creator_id, assignee_id, task_text, delay_final))
+
+async def schedule_intermediate_check(bot: Bot, task_id: int, creator_id: int, assignee_id: int, task_text: str, delay: float):
+    await asyncio.sleep(delay)
+    msg = f"🔄 Как продвигается задача?\n\n«{task_text}»"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Готово", callback_data=f"interim_done_{task_id}_{creator_id}")
+    kb.button(text="⏳ В процессе", callback_data=f"interim_ok_{task_id}")
+    kb.button(text="⚠️ Проблемы", callback_data=f"interim_problem_{task_id}_{creator_id}")
+    kb.adjust(1)
+    try:
+        await bot.send_message(assignee_id, msg, reply_markup=kb.as_markup())
+    except:
+        pass
+
+async def schedule_final_check(bot: Bot, task_id: int, creator_id: int, assignee_id: int, task_text: str, delay: float):
+    await asyncio.sleep(delay)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Выполнено", callback_data=f"done_{task_id}_{creator_id}")
+    kb.button(text="❌ Не сделано", callback_data=f"notdone_{task_id}_{creator_id}")
+    kb.adjust(1)
+    try:
+        await bot.send_message(assignee_id, f"⏰ Время вышло! Вы выполнили задачу?\n\n«{task_text}»", reply_markup=kb.as_markup())
+    except:
+        pass
+
 # === ФУНКЦИЯ ЗАПРОСА ПОДТВЕРЖДЕНИЯ ПРЕРЫВАНИЯ ===
 async def ask_to_cancel_current_task(message_or_callback, state: FSMContext, next_action):
     """Показывает кнопку подтверждения прерывания текущей задачи"""
@@ -193,7 +231,6 @@ async def my_tasks(message: Message):
 async def new_task_start(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is not None:
-        # Запрашиваем подтверждение
         await ask_to_cancel_current_task(message, state, "newtask")
         return
     
@@ -233,7 +270,6 @@ async def handle_any_message(message: Message, state: FSMContext):
 
     current_state = await state.get_state()
     if current_state is not None:
-        # Сохраняем текст для будущего использования
         await state.update_data(quick_task_text=message.text or "Задача из переписки")
         await ask_to_cancel_current_task(message, state, "quick_task")
         return
@@ -497,6 +533,11 @@ async def select_minute(callback: CallbackQuery, state: FSMContext):
         finally:
             await conn.close()
 
+        # Запускаем напоминания
+        asyncio.create_task(schedule_all_checks(
+            callback.bot, task_id, creator_id, assignee_id, text, deadline, checkpoints_enabled
+        ))
+
         deadline_fmt = deadline.strftime("%d.%m в %H:%M")
         assignee_name = data["assignee_name"]
         await callback.message.edit_text(f"✅ Задача назначена {assignee_name}!\n📅 Дедлайн: {deadline_fmt}")
@@ -607,6 +648,32 @@ async def check_due_tasks():
     finally:
         await conn.close()
 
+# === ВОССТАНОВЛЕНИЕ НАПОМИНАНИЙ ПРИ СТАРТЕ ===
+async def restore_pending_checks():
+    """Запускает напоминания для всех активных задач при старте бота"""
+    conn = await get_db()
+    try:
+        rows = await conn.fetch("""
+            SELECT id, creator_id, assignee_id, text, deadline, checkpoints_enabled
+            FROM tasks
+            WHERE status = 'pending'
+        """)
+    finally:
+        await conn.close()
+
+    for row in rows:
+        task_id = row["id"]
+        creator_id = row["creator_id"]
+        assignee_id = row["assignee_id"]
+        text = row["text"]
+        deadline = row["deadline"]
+        checkpoints_enabled = row["checkpoints_enabled"]
+        
+        asyncio.create_task(schedule_all_checks(
+            bot, task_id, creator_id, assignee_id, text, deadline, checkpoints_enabled
+        ))
+        print(f"[RESTORE] Восстановлены напоминания для задачи {task_id}")
+
 # === ОБРАБОТКА КНОПОК ===
 @router.callback_query(F.data.startswith("interim_done_"))
 async def interim_done(callback: CallbackQuery):
@@ -694,6 +761,7 @@ dp.include_router(router)
 
 async def main():
     await init_db()
+    await restore_pending_checks()  # ← КЛЮЧЕВОЕ ВОССТАНОВЛЕНИЕ
     asyncio.create_task(background_checker())
     await dp.start_polling(bot)
 
