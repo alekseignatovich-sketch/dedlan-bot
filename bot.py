@@ -1,11 +1,11 @@
-# bot.py — версия 25: /mytasks показывает все незавершённые задачи (без фильтра по времени)
+# bot.py — версия 26: защита от "сломанного" FSM + подтверждение прерывания
 import os
 import asyncio
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -105,6 +105,45 @@ async def get_frequent_assignees(creator_id: int):
     finally:
         await conn.close()
 
+# === ФУНКЦИЯ ЗАПРОСА ПОДТВЕРЖДЕНИЯ ПРЕРЫВАНИЯ ===
+async def ask_to_cancel_current_task(message_or_callback, state: FSMContext, next_action):
+    """Показывает кнопку подтверждения прерывания текущей задачи"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Продолжить", callback_data=f"confirm_{next_action}")
+    builder.button(text="❌ Отмена", callback_data="cancel_new_task")
+    builder.adjust(2)
+    
+    if isinstance(message_or_callback, Message):
+        await message_or_callback.answer(
+            "⚠️ Вы уже создаёте задачу. Начать новую и отменить текущую?",
+            reply_markup=builder.as_markup()
+        )
+    else:
+        await message_or_callback.message.edit_text(
+            "⚠️ Вы уже создаёте задачу. Начать новую и отменить текущую?",
+            reply_markup=builder.as_markup()
+        )
+    await state.update_data(pending_action=next_action)
+
+# === ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ===
+@router.callback_query(F.data.startswith("confirm_"))
+async def confirm_new_task(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split("_", 1)[1]
+    await state.clear()
+    
+    if action == "newtask":
+        await new_task_start_confirmed(callback.message, state)
+    elif action == "quick_task":
+        data = await state.get_data()
+        quick_text = data.get("quick_task_text", "Задача из переписки")
+        await start_quick_task_from_confirmation(callback, state, quick_text)
+    await callback.answer()
+
+@router.callback_query(F.data == "cancel_new_task")
+async def cancel_new_task(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("↩️ Создание задачи отменено. Продолжайте предыдущую.")
+    await callback.answer()
+
 # === ОСНОВНЫЕ КОМАНДЫ ===
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -152,6 +191,19 @@ async def my_tasks(message: Message):
 
 @router.message(Command("newtask"))
 async def new_task_start(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is not None:
+        # Запрашиваем подтверждение
+        await ask_to_cancel_current_task(message, state, "newtask")
+        return
+    
+    await state.clear()
+    await _start_new_task_flow(message, state)
+
+async def new_task_start_confirmed(message: Message, state: FSMContext):
+    await _start_new_task_flow(message, state)
+
+async def _start_new_task_flow(message: Message, state: FSMContext):
     await save_user(message.from_user)
     creator_id = message.from_user.id
     frequent = await get_frequent_assignees(creator_id)
@@ -172,13 +224,21 @@ async def new_task_start(message: Message, state: FSMContext):
     await message.answer("👥 Кому назначить задачу?", reply_markup=builder.as_markup())
     await state.set_state(TaskCreation.waiting_for_assignee)
 
-# === ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ТОЛЬКО ДЛЯ СООБЩЕНИЙ НЕ В FSM ===
-@router.message(StateFilter(None))
+# === ГЛОБАЛЬНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ ===
+@router.message()
 async def handle_any_message(message: Message, state: FSMContext):
     # Игнорируем команды
     if message.text and (message.text.startswith("/") or message.text.startswith("\\") or message.text.startswith("!")):
         return
 
+    current_state = await state.get_state()
+    if current_state is not None:
+        # Сохраняем текст для будущего использования
+        await state.update_data(quick_task_text=message.text or "Задача из переписки")
+        await ask_to_cancel_current_task(message, state, "quick_task")
+        return
+
+    await state.clear()
     await save_user(message.from_user)
     
     # Извлекаем текст или генерируем описание для медиа
@@ -215,7 +275,28 @@ async def handle_any_message(message: Message, state: FSMContext):
     )
     await state.update_data(quick_task_text=text)
 
-# === ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ===
+async def start_quick_task_from_confirmation(callback: CallbackQuery, state: FSMContext, quick_text: str):
+    await state.update_data(text=quick_text, is_quick_task=True)
+    creator_id = callback.from_user.id
+    frequent = await get_frequent_assignees(creator_id)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Себе", callback_data="assign_to_self")
+    if frequent:
+        builder.button(text="— ⭐ Ранее назначали —", callback_data="ignore")
+        for row in frequent:
+            uid = row["user_id"]
+            name = row["full_name"]
+            uname = row["username"]
+            label = format_name(uid, name, uname)
+            builder.button(text=label[:25], callback_data=f"pick_user_{uid}")
+    builder.button(text="📨 Другой пользователь", callback_data="assign_by_forward")
+    builder.adjust(1)
+    
+    await callback.message.edit_text("👥 Кому назначить задачу?", reply_markup=builder.as_markup())
+    await state.set_state(TaskCreation.waiting_for_assignee)
+    await callback.answer()
+
 @router.callback_query(F.data == "quick_task_from_forward")
 async def start_quick_task(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
