@@ -1,4 +1,4 @@
-# bot.py — версия 14: полностью на PostgreSQL (asyncpg)
+# bot.py — версия 15: полностью совместим с PostgreSQL на Railway
 import os
 import asyncio
 from datetime import datetime, timedelta
@@ -19,13 +19,10 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL не задан. Добавьте его в Railway Variables.")
-
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в .env")
+    raise ValueError("BOT_TOKEN не задан. Добавьте его в Railway Variables.")
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL не задан в .env")
+    raise ValueError("DATABASE_URL не задан. Убедитесь, что PostgreSQL привязан к сервису.")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -97,11 +94,12 @@ async def get_frequent_assignees(creator_id: int):
     conn = await get_db()
     try:
         rows = await conn.fetch("""
-            SELECT DISTINCT u.user_id, u.full_name, u.username
+            SELECT u.user_id, u.full_name, u.username
             FROM tasks t
             JOIN users u ON t.assignee_id = u.user_id
             WHERE t.creator_id = $1 AND u.user_id != $1
-            ORDER BY t.created_at DESC
+            GROUP BY u.user_id, u.full_name, u.username
+            ORDER BY MAX(t.created_at) DESC
             LIMIT 10
         """, creator_id)
         return rows
@@ -548,5 +546,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
